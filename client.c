@@ -1,17 +1,66 @@
 #include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <unistd.h>
+
+#include "util.h"
+
+const size_t k_max_msg = 4096;
+
+static int32_t query(int fd, const char *text)
+{
+    uint32_t len = (uint32_t)strlen(text);
+    if (len > k_max_msg) {
+        msg("message too long");
+        return -1;
+    }
+
+    char wbuf[4 + k_max_msg];
+    memcpy(wbuf, &len, 4); // Assume little endian
+    memcpy(&wbuf[4], text, len);
+    int32_t err = write_all(fd, wbuf, 4 + len);
+    if (err) {
+        msg("write()");
+        return err;
+    }
+
+    // 4 bytes header
+    char rbuf[4 + k_max_msg + 1];
+    errno = 0;
+    err = read_full(fd, rbuf, 4);
+    if (err) {
+        if (errno == 0) {
+            msg("EOF");
+        } else {
+            msg("read()");
+        }
+        return err;
+    }
+
+    memcpy(&len, rbuf, 4); // Assume little endian
+    if (len > k_max_msg) {
+        msg("response too long");
+        return -1;
+    }
+
+    // Reply body
+    err = read_full(fd, &rbuf[4], len);
+    if (err) {
+        msg("read()");
+        return err;
+    }
+
+    // Do something
+    rbuf[4 + len] = '\0';
+    printf("server says: %s\n", &rbuf[4]);
+    return 0;
+}
 
 int main(void)
 {
     // Make a connection
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        perror("socket");
-        exit(1);
+        die("socket()");
     }
 
     struct sockaddr_in addr = {};
@@ -20,37 +69,25 @@ int main(void)
     addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
     int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) {
-        perror("connect");
         close(fd);
-        exit(1);
+        die("connect()");
     }
 
-    char msg[] = "hello";
-    ssize_t written = write(fd, msg, strlen(msg));
-    if (written < 0) {
-        perror("write");
-        close(fd);
-        exit(1);
+    // Multiple requests
+    int32_t err = query(fd, "hello1");
+    if (err) {
+        goto L_DONE;
     }
-    if (written < strlen(msg)) {
-        fprintf(stderr, "Partial write occurred\n");
-        close(fd);
-        exit(1);
+    err = query(fd, "hello2");
+    if (err) {
+        goto L_DONE;
     }
-
-    char rbuf[64] = {};
-    ssize_t n = read(fd, rbuf, sizeof(rbuf) - 1);
-    if (n < 0) {
-        perror("read");
-        close(fd);
-        exit(1);
-    }
-    printf("server says: %s\n", rbuf);
-
-    if (close(fd) < 0) {
-        perror("close");
-        exit(1);
+    err = query(fd, "hello3");
+    if (err) {
+        goto L_DONE;
     }
 
+L_DONE:
+    close(fd);
     return 0;
 }

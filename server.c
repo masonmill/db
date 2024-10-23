@@ -1,28 +1,51 @@
-#include <errno.h>
 #include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
-// Read and write
-static void do_something(int connfd)
+#include "util.h"
+
+const size_t k_max_msg = 4096;
+
+static int32_t one_request(int connfd)
 {
-    char rbuf[64] = {};
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    if (n < 0) {
-        perror("read");
-        return;
+    // 4 bytes header
+    char rbuf[4 + k_max_msg + 1];
+    errno = 0;
+    int32_t err = read_full(connfd, rbuf, 4);
+    if (err) {
+        if (errno == 0) {
+            msg("EOF");
+        } else {
+            msg("read()");
+        }
+        return err;
     }
-    printf("client says: %s\n", rbuf);
 
-    char wbuf[] = "world";
-    ssize_t written = write(connfd, wbuf, strlen(wbuf));
-    if (written < 0) {
-        perror("write");
-        return;
+    uint32_t len = 0;
+    memcpy(&len, rbuf, 4); // Assume little endian
+    if (len > k_max_msg) {
+        msg("message too long");
+        return -1;
     }
+
+    // Request body
+    err = read_full(connfd, &rbuf[4], len);
+    if (err) {
+        msg("read()");
+        return err;
+    }
+
+    // Do something
+    rbuf[4 + len] = '\0';
+    printf("client says: %s\n", &rbuf[4]);
+
+    // Reply using the same protocol
+    const char reply[] = "world";
+    char wbuf[4 + sizeof(reply)];
+    len = (uint32_t)strlen(reply);
+    memcpy(wbuf, &len, 4);
+    memcpy(&wbuf[4], reply, len);
+    return write_all(connfd, wbuf, 4 + len);
 }
 
 int main(void)
@@ -30,16 +53,13 @@ int main(void)
     // Obtain a socket handle
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        perror("socket");
-        exit(1);
+        die("socket()");
     }
 
     // Configure the socket
     int val = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) < 0) {
-        perror("setsockopt");
-        close(fd);
-        exit(1);
+        die("setsockopt()");
     }
 
     // Bind to an address
@@ -49,17 +69,15 @@ int main(void)
     addr.sin_addr.s_addr = ntohl(0); // INADDR_ANY
     int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) {
-        perror("bind");
         close(fd);
-        exit(1);
+        die("bind()");
     }
 
     // Listen
     rv = listen(fd, SOMAXCONN);
     if (rv) {
-        perror("listen");
         close(fd);
-        exit(1);
+        die("listen()");
     }
 
     // Accept connections
@@ -68,15 +86,18 @@ int main(void)
         socklen_t addrlen = sizeof(client_addr);
         int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
         if (connfd < 0) {
-            perror("accept");
+            msg("accept()");
             continue; // Continue accepting other connections
         }
 
-        do_something(connfd);
-
-        if (close(connfd) < 0) {
-            perror("close connection");
+        // Only serves one client connection at a time
+        while (1) {
+            int32_t err = one_request(connfd);
+            if (err) {
+                break;
+            }
         }
+        close(connfd);
     }
 
     return 0;
